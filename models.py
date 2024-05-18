@@ -64,6 +64,49 @@ class EBM(nn.Module):
 
         return output
 
+class VICRegBlockF(nn.Module):
+    def __init__(self, inp_dim, out_dim):
+        super(VICRegBlockF, self).__init__()
+        assert inp_dim > out_dim
+        h = 512
+        self.fc1 = nn.Linear(inp_dim, h)
+        self.fc2 = nn.Linear(h, h)
+        self.fc3 = nn.Linear(h, h)
+        self.fc4 = nn.Linear(h, out_dim)
+    
+    def forward(self, x):
+        h = swish(self.fc1(x))
+        h = swish(self.fc2(h))
+        h = swish(self.fc3(h))
+        output = self.fc4(h)
+        return output
+
+class VICRegBlockH(nn.Module):
+    def __init__(self, inp_dim, out_dim):
+        super(VICRegBlockH, self).__init__()
+        assert inp_dim < out_dim
+        h = 512
+        self.fc1 = nn.Linear(inp_dim, h)
+        self.fc2 = nn.Linear(h, out_dim)
+    
+    def forward(self, x):
+        h = swish(self.fc1(x))
+        output = self.fc2(h)
+        return output
+
+class VICRegCombindedBlock(nn.Module):
+    def __init__(self, inp_dim, out_dim):
+        super(VICRegCombindedBlock, self).__init__()
+        h = 512
+        self.fc1 = nn.Linear(inp_dim, h)
+        self.fc2 = nn.Linear(h, h)
+        self.fc3 = nn.Linear(h, out_dim)
+
+    def forward(self, x):
+        h1 = swish(self.fc1(x))
+        h2 = swish(self.fc2(h1))
+        output = self.fc3(h2)
+        return output
 
 class EBMTwin(nn.Module):
     def __init__(self, inp_dim, out_dim, mem):

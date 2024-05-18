@@ -772,7 +772,7 @@ class QR(data.Dataset):
         flat = np.concatenate([q.flatten(), r.flatten()])
 
         flat_list = np.tile(flat[None, :], (self.num_steps, 1))
-        flat_start = np.random.uniform(-1, 1, (*flat.shape))
+        flat_start = np.random.uniform(-1, 1, *flat.shape)
         flat_list = np.concatenate([flat_start[None, :], flat_list], axis=0)
 
         return x.flatten(), flat  # , flat_list

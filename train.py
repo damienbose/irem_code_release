@@ -1,6 +1,6 @@
 import torch
 from models import EBM, FC, IterativeFC, IterativeAttention, IterativeFCAttention, \
-    IterativeTransformer, EBMTwin, RecurrentFC, PonderFC
+    IterativeTransformer, EBMTwin, RecurrentFC, PonderFC, VICRegCombindedBlock
 import torch.nn.functional as F
 import os
 import pdb
@@ -143,6 +143,10 @@ parser.add_argument('--log_interval', default=10, type=int,
 parser.add_argument('--save_interval', default=1000, type=int,
                     help='save outputs every so many batches')
 
+parser.add_argument('--pretrain', action='store_true',
+                    help='whether to pretrain the model usingle latent space supervion')
+parser.add_argument('--batch_size_test', default=512, type=int, help='size of batch of input to use for testing')
+
 # data
 parser.add_argument('--data_workers', default=4, type=int,
                     help='Number of different data workers to load data in parallel')
@@ -168,6 +172,8 @@ parser.add_argument('--mem', action='store_true',
                     help='add external memory to compute answers')
 parser.add_argument('--no_truncate', action='store_true',
                     help='don"t truncate gradient backprop')
+parser.add_argument('--lmbda', type=float)
+parser.add_argument('--decent_steps', default=80, type=int)
 
 # Distributed training hyperparameters
 parser.add_argument('--gpus', default=1, type=int,
@@ -258,26 +264,32 @@ def gen_answer(inp, FLAGS, model, pred, scratchpad, num_steps, create_graph=True
 
                 if FLAGS.mem:
                     im_merge = torch.cat([pred, inp, scratchpad], dim=-1)
+                if FLAGS.pretrain:
+                    im_merge = None
                 else:
                     im_merge = torch.cat([pred, inp], dim=-1)
-
-                energy = model.forward(im_merge)
+                
+                if FLAGS.pretrain:
+                    model_x, model_y = model # TODO: move model_x outside the loop
+                    energy = torch.square(model_x(inp) - model_y(pred)).mean(axis=1, keepdim=True) # is this correct axis?
+                else:
+                    energy = model.forward(im_merge)
 
                 if FLAGS.mem:
                     im_grad, scratchpad_grad = torch.autograd.grad(
-                        [energy.sum()], [pred, scratchpad], create_graph=create_graph)
+                        [energy.mean()], [pred, scratchpad], create_graph=create_graph)
                 else:
 
                     if FLAGS.no_truncate:
                         im_grad, = torch.autograd.grad(
-                            [energy.sum()], [pred], create_graph=create_graph)
+                            [energy.mean()], [pred], create_graph=create_graph)
                     else:
                         if i != (num_steps - 1):
                             im_grad, = torch.autograd.grad(
-                                [energy.sum()], [pred], create_graph=False)
+                                [energy.mean()], [pred], create_graph=False)
                         else:
                             im_grad, = torch.autograd.grad(
-                                [energy.sum()], [pred], create_graph=create_graph)
+                                [energy.mean()], [pred], create_graph=create_graph)
 
                 pred = pred - FLAGS.step_lr * im_grad
 
@@ -323,6 +335,26 @@ def init_model(FLAGS, device, dataset):
 
     return model, optimizer
 
+def init_pre_model(FLAGS, device, dataset):
+    model_x = VICRegCombindedBlock(dataset.inp_dim, dataset.out_dim) # input is 800, out is 400 # changes these from input_dim, input_dim
+    model_y = VICRegCombindedBlock(dataset.out_dim, dataset.out_dim)
+
+    model_x = model_x.to(device)
+    model_y = model_y.to(device)
+
+    model_x.train()
+    model_y.train()
+
+    model = (model_x, model_y)
+
+    params_to_optimize = [
+        {'params': model_x.parameters()},
+        {'params': model_y.parameters()}
+        ]
+    
+    optimizer = Adam(params_to_optimize, lr=1e-4)
+
+    return model, optimizer
 
 def safe_cumprod(t, eps=1e-10, dim=-1):
     t = torch.clip(t, min=eps, max=1.)
@@ -337,20 +369,29 @@ def exclusive_cumprod(t, dim=-1):
 def calc_geometric(l, dim=-1):
     return exclusive_cumprod(1 - l, dim=dim) * l
 
+# Create an instance of the MSE loss
+mse_loss = nn.MSELoss()
+relu = nn.ReLU()
 
-def test(train_dataloader, model, FLAGS, step=0):
+def test(train_dataloader, model, FLAGS, step=0, logger=None):
     global best_test_error_10, best_test_error_20, best_test_error_40, best_test_error_80, best_test_error
     if FLAGS.cuda:
         dev = torch.device("cuda")
     else:
         dev = torch.device("cpu")
-
     replay_buffer = None
     dist_list = []
     energy_list = []
     min_dist_list = []
 
-    model.eval()
+    if FLAGS.pretrain:
+        model_x, model_y = model
+        model_x.eval()
+        model_y.eval()
+        model = (model_x, model_y)
+    else:
+        model.eval()
+
     counter = 0
 
     with torch.no_grad():
@@ -364,7 +405,7 @@ def test(train_dataloader, model, FLAGS, step=0):
 
             pred_init = pred
             pred, preds, im_grad, energies, scratch, logits = gen_answer(
-                inp, FLAGS, model, pred, scratch, 80)
+                inp, FLAGS, model, pred, scratch, FLAGS.decent_steps)
             preds = torch.stack(preds, dim=0)
 
             if FLAGS.ponder:
@@ -407,11 +448,12 @@ def test(train_dataloader, model, FLAGS, step=0):
                 min_dist = torch.stack(min_dist_list, dim=0).mean()
 
                 print("Testing..................")
-                print("step errors: ", dist[:20])
+                print("step errors: ", dist)
                 print("energy values: ", energies)
                 print('test at step %d done!' % step)
                 break
-
+    
+    assert FLAGS.decent_steps >= 80
     if FLAGS.decoder or FLAGS.ponder:
         best_test_error_10 = min(best_test_error_10, dist[0].item())
         best_test_error_20 = min(best_test_error_20, dist[0].item())
@@ -428,8 +470,112 @@ def test(train_dataloader, model, FLAGS, step=0):
     print("best test error (10, 20, 40, 80, min_energy): {} {} {} {} {}".format(
             best_test_error_10, best_test_error_20, best_test_error_40,
             best_test_error_80, best_test_error))
+    
+    if logger is not None:
+        logger.add_scalar('test_error_10', best_test_error_10, step)
+        logger.add_scalar('test_error_20', best_test_error_20, step)
+        logger.add_scalar('test_error_40', best_test_error_40, step)
+        logger.add_scalar('test_error_80', best_test_error_80, step)
+        logger.add_scalar('test_error', best_test_error, step)
+        
+    if FLAGS.pretrain:
+        model_x, model_y = model
+        model_x.train()
+        model_y.train()
+    else:
+        model.train()
 
-    model.train()
+def off_diagonal(tensor):
+    n = tensor.size(0)  # assuming a square tensor
+    eye = torch.eye(n, dtype=torch.bool)
+    off_diagonal = tensor[~eye]
+    return off_diagonal
+
+def pre_train(train_dataloader, test_dataloader, logger, model_x, model_y,
+              optimizer, FLAGS, logdir, rank_idx):
+
+    model_x.train()
+    model_y.train()
+
+    # TODO: move these to FLAGS, note mu = lambda = 10 seemed to work
+    lmbda = mu = FLAGS.lmbda # set using grid search, and ensure lambda = mu > 1
+    nu = 1 # kept constant
+
+    it = FLAGS.resume_iter
+    optimizer.zero_grad()
+    dev = torch.device("cuda")
+
+    for epoch in range(FLAGS.num_epoch):
+        for x, y in train_dataloader:
+
+            x = x.float().to(dev)
+            y = y.float().to(dev)
+
+            # compute representations
+            z_a = model_x(x)
+            z_b = model_y(y)
+
+            N, D = z_a.size() # number of samples and dimensionality of the representation
+
+            # print(z_a.size(), z_b.size())
+
+            # invariance loss
+            sim_loss = mse_loss(z_a, z_b)
+
+            # variance loss
+            std_z_a = torch.sqrt(z_a.var(dim=0) + 1e-04)
+            std_z_b = torch.sqrt(z_b.var(dim=0) + 1e-04)
+            std_loss = torch.mean(relu(1 - std_z_a)) + torch.mean(
+            relu(1 - std_z_b))
+
+            # covariance loss
+            z_a = z_a - z_a.mean(dim=0)
+            z_b = z_b - z_b.mean(dim=0)
+            cov_z_a = (z_a.T @ z_a) / (N - 1)
+            cov_z_b = (z_b.T @ z_b) / (N - 1)
+            cov_loss = off_diagonal(cov_z_a).pow_(2).sum() / D
+            + off_diagonal(cov_z_b).pow_(2).sum() / D
+
+            # loss
+            loss = lmbda * sim_loss + mu * std_loss + nu * cov_loss
+
+            # optimization step
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+
+            # Track run statistics
+            if it % FLAGS.log_interval == 0 and rank_idx == 0:
+                kvs = {}
+                # Combined loss
+                kvs['loss'] = loss.item()
+
+                # Components
+                kvs['energy_loss'] = sim_loss.item()
+                kvs['std_loss'] = std_loss.item()
+                kvs['cov_loss'] = cov_loss.item()
+
+                string = "Iteration {} ".format(it)
+
+                for k, v in kvs.items():
+                    string += "%s: %.6f  " % (k, v)
+                    logger.add_scalar(k, v, it)
+
+                print(string)
+
+            # Save the model
+            if it % FLAGS.save_interval == 0 and rank_idx == 0:
+                model_path = osp.join(logdir, "model_latest.pth".format(it))
+                ckpt = {'FLAGS': FLAGS}
+
+                ckpt['model_state_dict_x'] = model_x.state_dict()
+                ckpt['model_state_dict_y'] = model_y.state_dict()
+                ckpt['optimizer_state_dict'] = optimizer.state_dict()
+                torch.save(ckpt, model_path)
+                                
+                test(test_dataloader, (model_x, model_y), FLAGS, step=it, logger=logger)
+
+            it += 1
 
 
 def train(train_dataloader, test_dataloader, logger, model,
@@ -658,37 +804,51 @@ def main_single(rank, FLAGS):
     FLAGS_OLD = FLAGS
 
     # Load model and key arguments
-    if FLAGS.resume_iter != 0:
+    if not FLAGS.train: # Only load during testing instead
         model_path = osp.join(
             logdir, "model_latest.pth".format(
                 FLAGS.resume_iter))
+        
+        print("Loading model from: ", model_path)
 
         checkpoint = torch.load(model_path, map_location=torch.device('cpu'))
-        FLAGS = checkpoint['FLAGS']
+        # FLAGS = checkpoint['FLAGS']
 
-        FLAGS.resume_iter = FLAGS_OLD.resume_iter
-        FLAGS.save_interval = FLAGS_OLD.save_interval
-        FLAGS.gpus = FLAGS_OLD.gpus
-        FLAGS.train = FLAGS_OLD.train
-        FLAGS.batch_size = FLAGS_OLD.batch_size
-        FLAGS.step_lr = FLAGS_OLD.step_lr
-        FLAGS.num_steps = FLAGS_OLD.num_steps
-        FLAGS.exp = FLAGS_OLD.exp
-        FLAGS.ponder = FLAGS_OLD.ponder
-        FLAGS.heatmap = FLAGS_OLD.heatmap
+        # FLAGS.resume_iter = FLAGS_OLD.resume_iter
+        # FLAGS.save_interval = FLAGS_OLD.save_interval
+        # FLAGS.gpus = FLAGS_OLD.gpus
+        # FLAGS.train = FLAGS_OLD.train
+        # FLAGS.batch_size = FLAGS_OLD.batch_size
+        # FLAGS.step_lr = FLAGS_OLD.step_lr
+        # FLAGS.num_steps = FLAGS_OLD.num_steps
+        # FLAGS.exp = FLAGS_OLD.exp
+        # FLAGS.ponder = FLAGS_OLD.ponder
+        # FLAGS.heatmap = FLAGS_OLD.heatmap
 
-        model, optimizer = init_model(FLAGS, device, dataset)
-        state_dict = model.state_dict()
+        if FLAGS.pretrain:
+            model, optimizer = init_pre_model(FLAGS, device, dataset)
+        else:
+            model, optimizer = init_model(FLAGS, device, dataset)
 
-        model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        if FLAGS.pretrain:
+            model_x, model_y = model
+            model_x.load_state_dict(checkpoint['model_state_dict_x'], strict=False)
+            model_y.load_state_dict(checkpoint['model_state_dict_y'], strict=False)
+            model = (model_x, model_y)
+        else:
+            model.load_state_dict(checkpoint['model_state_dict'], strict=False)
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     else:
-        model, optimizer = init_model(FLAGS, device, dataset)
+        if FLAGS.pretrain:
+            model, optimizer = init_pre_model(FLAGS, device, dataset)
+            model_x, model_y = model
+        else:
+            model, optimizer = init_model(FLAGS, device, dataset)
 
     if FLAGS.gpus > 1:
         sync_model(model)
 
-    print("num_parameters: ", sum([p.numel() for p in model.parameters()]))
+    # print("num_parameters: ", sum([p.numel() for p in model.parameters()]))
 
     train_dataloader = DataLoader(
         dataset,
@@ -700,7 +860,7 @@ def main_single(rank, FLAGS):
     test_dataloader = DataLoader(
         test_dataset,
         num_workers=FLAGS.data_workers,
-        batch_size=FLAGS.batch_size,
+        batch_size=FLAGS.batch_size_test,
         shuffle=True,
         pin_memory=False,
         drop_last=True,
@@ -709,13 +869,30 @@ def main_single(rank, FLAGS):
     logger = SummaryWriter(logdir)
     it = FLAGS.resume_iter
 
-    if FLAGS.train:
-        model.train()
-    else:
-        model.eval()
+    # if FLAGS.train:
+    #     model.train()
+    # else:
+    #     model.eval()
+    
+    # if FLAGS.pretrain:
+    #     model, optimizer = init_pre_model(FLAGS, device, dataset)
+    #     model_x, model_y = model
+
 
     if FLAGS.train:
-        train(
+        if FLAGS.pretrain:
+            pre_train(
+                train_dataloader,
+                test_dataloader,
+                logger,
+                model_x,
+                model_y,
+                optimizer,
+                FLAGS,
+                logdir,
+                rank_idx)
+        else:
+            train(
             train_dataloader,
             test_dataloader,
             logger,
@@ -725,7 +902,10 @@ def main_single(rank, FLAGS):
             logdir,
             rank_idx)
     else:
-        test(test_dataloader, model, FLAGS, step=FLAGS.resume_iter)
+        if FLAGS.pretrain:
+            test(test_dataloader, (model_x, model_y), FLAGS, step=1)
+        else:
+            test(test_dataloader, model, FLAGS, step=FLAGS.resume_iter)
 
 
 def main():
