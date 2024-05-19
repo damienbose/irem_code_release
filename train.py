@@ -9,7 +9,10 @@ from dataset import LowRankDataset, ShortestPath, Negate, Inverse, Square, Ident
 import matplotlib.pyplot as plt
 import torch.multiprocessing as mp
 import torch.distributed as dist
-from torch.optim import Adam
+from torch.optim import Adam, AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau, LambdaLR
+import math
+
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
 import os.path as osp
@@ -331,9 +334,9 @@ def init_model(FLAGS, device, dataset):
         model = EBM(dataset.inp_dim, dataset.out_dim, FLAGS.mem)
 
     model.to(device)
-    optimizer = Adam(model.parameters(), lr=1e-4)
+    optimizer = Adam(model.parameters(), lr=FLAGS.lr) # Higher weight wegiht decay would me more regularization
 
-    return model, optimizer
+    return model, optimizer, scheduler
 
 def init_pre_model(FLAGS, device, dataset):
     model_x = VICRegCombindedBlock(dataset.inp_dim, dataset.out_dim) # input is 800, out is 400 # changes these from input_dim, input_dim
@@ -352,9 +355,15 @@ def init_pre_model(FLAGS, device, dataset):
         {'params': model_y.parameters()}
         ]
     
-    optimizer = Adam(params_to_optimize, lr=1e-4)
+    # Look at adamW for weight decays
+    optimizer = Adam(params_to_optimize, lr=FLAGS.lr) # Higher weight wegiht decay would me more regularization
+    # scheduler = CosineAnnealingLR(optimizer, T_max=FLAGS.lr)
+    # scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2000, threshold=1e-4)
+    # scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=gamma)
+    gamma = math.exp(math.log(0.5) / 25000) # so that gamma halves every 25000 iterations
+    scheduler = LambdaLR(optimizer, lr_lambda=lambda epoch: gamma ** epoch)
 
-    return model, optimizer
+    return model, (optimizer, scheduler)
 
 def safe_cumprod(t, eps=1e-10, dim=-1):
     t = torch.clip(t, min=eps, max=1.)
@@ -493,6 +502,8 @@ def off_diagonal(tensor):
 
 def pre_train(train_dataloader, test_dataloader, logger, model_x, model_y,
               optimizer, FLAGS, logdir, rank_idx):
+    
+    optimizer, scheduler = optimizer
 
     model_x.train()
     model_y.train()
@@ -543,6 +554,7 @@ def pre_train(train_dataloader, test_dataloader, logger, model_x, model_y,
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
+            scheduler.step()
 
             # Track run statistics
             if it % FLAGS.log_interval == 0 and rank_idx == 0:
@@ -554,6 +566,8 @@ def pre_train(train_dataloader, test_dataloader, logger, model_x, model_y,
                 kvs['energy_loss'] = sim_loss.item()
                 kvs['std_loss'] = std_loss.item()
                 kvs['cov_loss'] = cov_loss.item()
+
+                kvs['learning_rate'] = optimizer.param_groups[0]['lr'] # Should be the same as that from the scheduler
 
                 string = "Iteration {} ".format(it)
 
@@ -575,7 +589,7 @@ def pre_train(train_dataloader, test_dataloader, logger, model_x, model_y,
                                 
                 test(test_dataloader, (model_x, model_y), FLAGS, step=it, logger=logger)
 
-            it += 1
+            it += 1 # todo: STEP THE SCHEDULER
 
 
 def train(train_dataloader, test_dataloader, logger, model,
@@ -668,6 +682,9 @@ def train(train_dataloader, test_dataloader, logger, model,
                 assert False
 
             if it % FLAGS.log_interval == 0 and rank_idx == 0:
+                # Update
+                scheduler.step()
+
                 loss = loss.item()
                 kvs = {}
                 kvs['im_loss'] = im_loss.mean().item()
@@ -722,12 +739,6 @@ def main_single(rank, FLAGS):
     rank_idx = rank
     world_size = FLAGS.gpus
     logdir = osp.join(FLAGS.logdir, FLAGS.exp)
-
-    if not os.path.exists('result/%s' % FLAGS.exp):
-        try:
-            os.makedirs('result/%s' % FLAGS.exp)
-        except BaseException:
-            pass
 
     if not os.path.exists(logdir):
         try:
@@ -837,7 +848,7 @@ def main_single(rank, FLAGS):
             model = (model_x, model_y)
         else:
             model.load_state_dict(checkpoint['model_state_dict'], strict=False)
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        # optimizer.load_state_dict(checkpoint['optimizer_state_dict']) # TODO: add the scheduler here as well
     else:
         if FLAGS.pretrain:
             model, optimizer = init_pre_model(FLAGS, device, dataset)

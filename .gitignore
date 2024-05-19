@@ -1,12 +1,11 @@
-.venv/*
+.venv*/*
 __pycache__/*
 cachedir/*
 final/*
 smaller_step/*
-test/*
 moder_step/*
 stp_0_09/*
 random_checkpoint_works_well/*
-test_2/*
-test_3/*
-test_4/*
+test*/*
+lr/*
+results/*
